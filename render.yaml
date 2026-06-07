@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: creatorly-video-server
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: SUPABASE_URL
+        value: https://vogzafjwkzhxoahpxwsr.supabase.co
+      - key: SUPABASE_KEY
+        sync: false
+    plan: free
