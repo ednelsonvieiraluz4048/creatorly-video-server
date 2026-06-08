@@ -116,18 +116,18 @@ async def generate_free_video(req: VideoRequest):
                           fill=color, stroke_width=stroke, stroke_fill=(0, 0, 0))
 
         # Hook — topo
-        draw_text_wrapped(draw, req.hook_text, 80, 44, (255, 255, 255), W - 80)
+        draw_text_wrapped(draw, req.hook_text, 80, 26, (255, 255, 255), W - 80)
 
         # Nome do produto — meio
         if req.product_name:
-            draw_text_wrapped(draw, req.product_name.upper(), H // 2 - 30, 36, (0, 255, 136), W - 80, stroke=1)
+            draw_text_wrapped(draw, req.product_name.upper(), H // 2 - 20, 22, (0, 255, 136), W - 80, stroke=1)
 
         # CTA — rodapé
-        draw_text_wrapped(draw, req.cta_text, H - 200, 42, (255, 255, 255), W - 80)
+        draw_text_wrapped(draw, req.cta_text, H - 160, 25, (255, 255, 255), W - 80)
 
         # Hashtags
         if req.hashtags:
-            draw_text_wrapped(draw, req.hashtags[:60], H - 100, 26, (170, 170, 170), W - 80, stroke=1)
+            draw_text_wrapped(draw, req.hashtags[:60], H - 80, 16, (170, 170, 170), W - 80, stroke=1)
 
         # Salvar frame tratado
         frame_path = tmp_dir / f"frame_{job_id}.jpg"
