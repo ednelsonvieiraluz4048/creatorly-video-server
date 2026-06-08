@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
-import httpx, asyncio, os, uuid, tempfile, traceback
+import httpx, asyncio, os, uuid, tempfile, traceback, subprocess
 from pathlib import Path
 
 app = FastAPI(title="Creatorly Video Server")
@@ -18,9 +18,9 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://vogzafjwkzhxoahpxwsr.supa
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
 class VideoRequest(BaseModel):
-    audio_url: str                    # URL do áudio ElevenLabs
-    product_image_url: str            # URL da imagem do produto
-    hook_text: str                    # Texto do hook
+    audio_url: str
+    product_image_url: str
+    hook_text: str
     cta_text: Optional[str] = "Clica no carrinho aqui embaixo!"
     product_name: Optional[str] = ""
     hashtags: Optional[str] = ""
@@ -29,7 +29,7 @@ class VideoRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "Creatorly Video Server online", "version": "1.0"}
+    return {"status": "Creatorly Video Server online", "version": "2.0"}
 
 @app.get("/health")
 def health():
@@ -37,53 +37,30 @@ def health():
 
 @app.post("/generate-free")
 async def generate_free_video(req: VideoRequest):
-    """
-    Pipeline Free — custo zero:
-    1. Baixa imagem do produto
-    2. Baixa áudio ElevenLabs
-    3. Cria vídeo com moviepy:
-       - Produto animado (zoom cinematic)
-       - Hook na tela (texto animado)
-       - Áudio sincronizado
-       - CTA final
-    4. Faz upload para Supabase Storage
-    5. Retorna URL pública do vídeo
-    """
     job_id = str(uuid.uuid4())[:8]
     tmp_dir = Path(tempfile.mkdtemp())
 
     try:
         # ── 1. Baixar assets ─────────────────────────────────────
         async with httpx.AsyncClient(timeout=30) as client:
-            # Imagem do produto
             img_resp = await client.get(req.product_image_url)
             if img_resp.status_code != 200:
                 raise HTTPException(400, "Não foi possível baixar a imagem do produto")
             img_path = tmp_dir / f"product_{job_id}.jpg"
             img_path.write_bytes(img_resp.content)
 
-            # Áudio ElevenLabs
             audio_resp = await client.get(req.audio_url)
             if audio_resp.status_code != 200:
                 raise HTTPException(400, "Não foi possível baixar o áudio")
             audio_path = tmp_dir / f"audio_{job_id}.mp3"
             audio_path.write_bytes(audio_resp.content)
 
-        # ── 2. Compor vídeo com moviepy ──────────────────────────
-        from moviepy.editor import (
-            ImageClip, AudioFileClip, TextClip,
-            CompositeVideoClip, concatenate_videoclips,
-            ColorClip
-        )
-        from PIL import Image
+        # ── 2. Preparar imagem 9:16 720x1280 com Pillow ──────────
+        from PIL import Image, ImageDraw, ImageFont
         import numpy as np
 
-        # Carregar áudio e descobrir duração
-        audio = AudioFileClip(str(audio_path))
-        duration = audio.duration  # duração real do áudio
+        W, H = 720, 1280
 
-        # Redimensionar imagem para 9:16 (1080x1920)
-        W, H = 1080, 1920
         img = Image.open(str(img_path)).convert("RGB")
 
         # Crop inteligente para 9:16
@@ -99,106 +76,103 @@ async def generate_free_video(req: VideoRequest):
             img = img.crop((0, offset, img.width, offset + new_h))
         img = img.resize((W, H), Image.LANCZOS)
 
-        # Salvar imagem tratada
-        img_treated = tmp_dir / f"treated_{job_id}.jpg"
-        img.save(str(img_treated), quality=95)
+        # Overlay escuro para legibilidade do texto
+        overlay = Image.new("RGBA", (W, H), (0, 0, 0, 90))
+        img = img.convert("RGBA")
+        img = Image.alpha_composite(img, overlay).convert("RGB")
 
-        # ── Animação zoom-in cinematic (Ken Burns effect) ─────────
-        def make_zoom_frame(t):
-            """Zoom suave de 1.0x → 1.12x durante a duração"""
-            zoom = 1.0 + (0.12 * t / duration)
-            zoom = min(zoom, 1.15)
-            frame = np.array(img)
-            h, w = frame.shape[:2]
-            new_h = int(h / zoom)
-            new_w = int(w / zoom)
-            y1 = (h - new_h) // 2
-            x1 = (w - new_w) // 2
-            cropped = frame[y1:y1+new_h, x1:x1+new_w]
-            from PIL import Image as PILImage
-            resized = PILImage.fromarray(cropped).resize((W, H), PILImage.LANCZOS)
-            return np.array(resized)
+        # ── 3. Adicionar textos na imagem ────────────────────────
+        draw = ImageDraw.Draw(img)
 
-        product_clip = VideoClip(make_zoom_frame, duration=duration)
+        def get_font(size):
+            for font_path in [
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+                "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+            ]:
+                if os.path.exists(font_path):
+                    return ImageFont.truetype(font_path, size)
+            return ImageFont.load_default()
 
-        # ── Overlay escuro sutil para texto legível ───────────────
-        dark_overlay = ColorClip(size=(W, H), color=[0, 0, 0], duration=duration)
-        dark_overlay = dark_overlay.set_opacity(0.35)
+        def draw_text_wrapped(draw, text, y, font_size, color, max_width, stroke=2):
+            font = get_font(font_size)
+            words = text.split()
+            lines, line = [], ""
+            for word in words:
+                test = (line + " " + word).strip()
+                bbox = draw.textbbox((0, 0), test, font=font)
+                if bbox[2] <= max_width:
+                    line = test
+                else:
+                    if line: lines.append(line)
+                    line = word
+            if line: lines.append(line)
+            lines = lines[:4]
+            for i, l in enumerate(lines):
+                bbox = draw.textbbox((0, 0), l, font=font)
+                x = (W - (bbox[2] - bbox[0])) // 2
+                draw.text((x, y + i * (font_size + 8)), l, font=font,
+                          fill=color, stroke_width=stroke, stroke_fill=(0, 0, 0))
 
-        # ── Hook text (aparece nos primeiros 3s) ──────────────────
-        hook_lines = _wrap_text(req.hook_text, max_chars=28)
-        hook_clip = TextClip(
-            hook_lines,
-            fontsize=72,
-            font="DejaVu-Sans-Bold",
-            color="white",
-            stroke_color="black",
-            stroke_width=3,
-            method="caption",
-            size=(W - 120, None),
-            align="center"
-        ).set_position(("center", 180)).set_duration(min(4.5, duration))
+        # Hook — topo
+        draw_text_wrapped(draw, req.hook_text, 120, 52, (255, 255, 255), W - 80)
 
-        # ── Produto label (aparece no meio) ───────────────────────
-        product_label = ""
+        # Nome do produto — meio
         if req.product_name:
-            product_label = req.product_name.upper()
-        label_clip = TextClip(
-            product_label,
-            fontsize=44,
-            font="DejaVu-Sans-Bold",
-            color="#00FF88",
-            stroke_color="black",
-            stroke_width=2,
-            method="label"
-        ).set_position(("center", H - 380)).set_start(2.0).set_duration(duration - 2.0) if product_label else None
+            draw_text_wrapped(draw, req.product_name.upper(), H // 2 - 30, 36, (0, 255, 136), W - 80, stroke=1)
 
-        # ── CTA final (últimos 4s) ────────────────────────────────
-        cta_start = max(0, duration - 4.5)
-        cta_clip = TextClip(
-            req.cta_text,
-            fontsize=52,
-            font="DejaVu-Sans-Bold",
-            color="white",
-            bg_color="#FF0050",
-            stroke_color="black",
-            stroke_width=1,
-            method="caption",
-            size=(W - 80, None),
-            align="center"
-        ).set_position(("center", H - 220)).set_start(cta_start).set_duration(duration - cta_start)
+        # CTA — rodapé
+        draw_text_wrapped(draw, req.cta_text, H - 200, 42, (255, 255, 255), W - 80)
 
-        # ── Hashtags (últimos 2s) ─────────────────────────────────
-        tags_start = max(0, duration - 2.5)
-        hashtag_clip = TextClip(
-            req.hashtags[:80] if req.hashtags else "",
-            fontsize=32,
-            font="DejaVu-Sans",
-            color="#aaaaaa",
-            method="label"
-        ).set_position(("center", H - 120)).set_start(tags_start).set_duration(duration - tags_start) if req.hashtags else None
+        # Hashtags
+        if req.hashtags:
+            draw_text_wrapped(draw, req.hashtags[:60], H - 100, 26, (170, 170, 170), W - 80, stroke=1)
 
-        # ── Composição final ──────────────────────────────────────
-        layers = [product_clip, dark_overlay, hook_clip, cta_clip]
-        if label_clip: layers.append(label_clip)
-        if hashtag_clip: layers.append(hashtag_clip)
+        # Salvar frame tratado
+        frame_path = tmp_dir / f"frame_{job_id}.jpg"
+        img.save(str(frame_path), quality=90)
 
-        final = CompositeVideoClip(layers, size=(W, H))
-        final = final.set_audio(audio)
-
-        # ── Render ────────────────────────────────────────────────
-        output_path = tmp_dir / f"video_{job_id}.mp4"
-        final.write_videofile(
-            str(output_path),
-            fps=30,
-            codec="libx264",
-            audio_codec="aac",
-            preset="ultrafast",
-            threads=2,
-            logger=None
+        # ── 4. Obter duração do áudio ────────────────────────────
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(audio_path)],
+            capture_output=True, text=True
         )
+        try:
+            duration = float(probe.stdout.strip())
+        except:
+            duration = 30.0
 
-        # ── 3. Upload para Supabase Storage ──────────────────────
+        # ── 5. Compor vídeo com ffmpeg direto ────────────────────
+        output_path = tmp_dir / f"video_{job_id}.mp4"
+
+        # ffmpeg: imagem estática + fade in/out + áudio
+        # Muito mais rápido que moviepy frame-a-frame
+        ffmpeg_cmd = [
+            "ffmpeg", "-y",
+            "-loop", "1",
+            "-i", str(frame_path),
+            "-i", str(audio_path),
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-tune", "stillimage",
+            "-crf", "28",
+            "-vf", f"fade=t=in:st=0:d=0.5,fade=t=out:st={max(0, duration-0.8)}:d=0.8,scale={W}:{H}:force_original_aspect_ratio=disable",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-shortest",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            "-t", str(duration + 0.5),
+            str(output_path)
+        ]
+
+        proc = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=120)
+        if proc.returncode != 0:
+            print("ffmpeg stderr:", proc.stderr[-500:])
+            raise HTTPException(500, f"ffmpeg falhou: {proc.stderr[-200:]}")
+
+        # ── 6. Upload para Supabase Storage ──────────────────────
         video_bytes = output_path.read_bytes()
         filename = f"free-videos/{req.user_id or 'anon'}/{job_id}.mp4"
 
@@ -213,6 +187,9 @@ async def generate_free_video(req: VideoRequest):
                 content=video_bytes
             )
 
+        if upload.status_code not in (200, 201):
+            raise HTTPException(500, f"Falha no upload: {upload.status_code} — {upload.text[:200]}")
+
         video_url = f"{SUPABASE_URL}/storage/v1/object/public/product-frames/{filename}"
 
         return {
@@ -222,31 +199,15 @@ async def generate_free_video(req: VideoRequest):
             "job_id": job_id
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(500, f"Erro na geração: {str(e)}")
     finally:
-        # Limpar arquivos temporários
         import shutil
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-
-def _wrap_text(text: str, max_chars: int = 28) -> str:
-    """Quebra texto em linhas para caber na tela"""
-    words = text.split()
-    lines, current = [], ""
-    for word in words:
-        if len(current) + len(word) + 1 <= max_chars:
-            current += ("" if not current else " ") + word
-        else:
-            if current: lines.append(current)
-            current = word
-    if current: lines.append(current)
-    return "\n".join(lines[:4])  # max 4 linhas
-
-
-# Importar VideoClip aqui para o Ken Burns
-from moviepy.video.VideoClip import VideoClip
 
 if __name__ == "__main__":
     import uvicorn
