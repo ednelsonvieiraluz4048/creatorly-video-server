@@ -180,6 +180,7 @@ async def generate_free_video(req: VideoRequest):
             upload = await client.post(
                 f"{SUPABASE_URL}/storage/v1/object/product-frames/{filename}",
                 headers={
+                    "apikey": SUPABASE_KEY,
                     "Authorization": f"Bearer {SUPABASE_KEY}",
                     "Content-Type": "video/mp4",
                     "x-upsert": "true"
