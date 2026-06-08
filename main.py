@@ -203,8 +203,12 @@ async def generate_free_video(req: VideoRequest):
     except HTTPException:
         raise
     except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(500, f"Erro na geração: {str(e)}")
+        import sys
+        tb = traceback.format_exc()
+        print("=== ERRO DETALHADO ===", flush=True)
+        print(tb, flush=True)
+        print("=== FIM ERRO ===", flush=True)
+        raise HTTPException(500, f"Erro na geração: {str(e)} | {tb[-300:]}")
     finally:
         import shutil
         shutil.rmtree(tmp_dir, ignore_errors=True)
