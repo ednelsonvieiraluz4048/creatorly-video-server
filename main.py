@@ -63,7 +63,7 @@ async def generate_free_video(req: VideoRequest):
 
         img = Image.open(str(img_path)).convert("RGB")
 
-        # Crop inteligente para 9:16
+        # Crop inteligente para 9:16 — centralizado verticalmente com leve foco no topo
         ratio = W / H
         img_ratio = img.width / img.height
         if img_ratio > ratio:
@@ -72,7 +72,8 @@ async def generate_free_video(req: VideoRequest):
             img = img.crop((offset, 0, offset + new_w, img.height))
         else:
             new_h = int(img.width / ratio)
-            offset = (img.height - new_h) // 2
+            # Foco no centro (não no topo) para produtos — evita cortar o produto
+            offset = max(0, (img.height - new_h) // 3)
             img = img.crop((0, offset, img.width, offset + new_h))
         img = img.resize((W, H), Image.LANCZOS)
 
@@ -107,7 +108,7 @@ async def generate_free_video(req: VideoRequest):
                     if line: lines.append(line)
                     line = word
             if line: lines.append(line)
-            lines = lines[:4]
+            lines = lines[:6]
             for i, l in enumerate(lines):
                 bbox = draw.textbbox((0, 0), l, font=font)
                 x = (W - (bbox[2] - bbox[0])) // 2
@@ -115,7 +116,7 @@ async def generate_free_video(req: VideoRequest):
                           fill=color, stroke_width=stroke, stroke_fill=(0, 0, 0))
 
         # Hook — topo
-        draw_text_wrapped(draw, req.hook_text, 120, 52, (255, 255, 255), W - 80)
+        draw_text_wrapped(draw, req.hook_text, 80, 44, (255, 255, 255), W - 80)
 
         # Nome do produto — meio
         if req.product_name:
