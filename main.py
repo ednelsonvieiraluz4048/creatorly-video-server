@@ -27,16 +27,156 @@ class VideoRequest(BaseModel):
     user_id: Optional[str] = ""
     titulo: Optional[str] = "Vídeo Creatorly"
 
+class MergeRequest(BaseModel):
+    video_url: str          # URL do vídeo Kling (sem áudio)
+    audio_url: str          # URL pública do áudio ElevenLabs no Supabase
+    user_id: Optional[str] = ""
+
 @app.get("/")
 def root():
-    return {"status": "Creatorly Video Server online", "version": "2.0"}
+    return {"status": "Creatorly Video Server online", "version": "2.1"}
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+@app.post("/merge")
+async def merge_video_audio(req: MergeRequest):
+    """
+    Merge de vídeo Kling (sem áudio) + áudio ElevenLabs.
+    Retorna URL pública do vídeo final com áudio sincronizado.
+    """
+    job_id = str(uuid.uuid4())[:8]
+    tmp_dir = Path(tempfile.mkdtemp())
+
+    try:
+        # ── 1. Baixar vídeo e áudio ──────────────────────────────
+        async with httpx.AsyncClient(timeout=60) as client:
+            video_resp = await client.get(req.video_url)
+            if video_resp.status_code != 200:
+                raise HTTPException(400, f"Não foi possível baixar o vídeo: {video_resp.status_code}")
+            video_path = tmp_dir / f"video_{job_id}.mp4"
+            video_path.write_bytes(video_resp.content)
+
+            audio_resp = await client.get(req.audio_url)
+            if audio_resp.status_code != 200:
+                raise HTTPException(400, f"Não foi possível baixar o áudio: {audio_resp.status_code}")
+            audio_path = tmp_dir / f"audio_{job_id}.mp3"
+            audio_path.write_bytes(audio_resp.content)
+
+        # ── 2. Obter durações ────────────────────────────────────
+        def get_duration(path):
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+                capture_output=True, text=True
+            )
+            try:
+                return float(probe.stdout.strip())
+            except:
+                return 0.0
+
+        video_dur = get_duration(video_path)
+        audio_dur = get_duration(audio_path)
+        print(f"[merge] video: {video_dur:.1f}s | audio: {audio_dur:.1f}s")
+
+        # ── 3. Merge com ffmpeg ──────────────────────────────────
+        output_path = tmp_dir / f"merged_{job_id}.mp4"
+
+        # Estratégia: áudio define o tempo final
+        # Se áudio for maior que vídeo → loop no vídeo
+        # Se vídeo for maior → corta no fim do áudio
+        if audio_dur > video_dur and video_dur > 0:
+            # Loop no vídeo para cobrir o áudio
+            ffmpeg_cmd = [
+                "ffmpeg", "-y",
+                "-stream_loop", "-1", "-i", str(video_path),
+                "-i", str(audio_path),
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-crf", "26",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-shortest",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                "-t", str(audio_dur + 0.3),
+                str(output_path)
+            ]
+        else:
+            # Vídeo >= áudio — corta no fim do áudio
+            ffmpeg_cmd = [
+                "ffmpeg", "-y",
+                "-i", str(video_path),
+                "-i", str(audio_path),
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-crf", "26",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-shortest",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                str(output_path)
+            ]
+
+        proc = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=120)
+        if proc.returncode != 0:
+            print("ffmpeg stderr:", proc.stderr[-500:])
+            raise HTTPException(500, f"ffmpeg merge falhou: {proc.stderr[-200:]}")
+
+        # ── 4. Upload para Supabase Storage ──────────────────────
+        video_bytes = output_path.read_bytes()
+        filename = f"merged-videos/{req.user_id or 'anon'}/{job_id}.mp4"
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            upload = await client.post(
+                f"{SUPABASE_URL}/storage/v1/object/product-frames/{filename}",
+                headers={
+                    "apikey": SUPABASE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "Content-Type": "video/mp4",
+                    "x-upsert": "true"
+                },
+                content=video_bytes
+            )
+
+        if upload.status_code not in (200, 201):
+            raise HTTPException(500, f"Falha no upload do merge: {upload.status_code} — {upload.text[:200]}")
+
+        merged_url = f"{SUPABASE_URL}/storage/v1/object/public/product-frames/{filename}"
+        print(f"[merge] ✅ merged_url: {merged_url}")
+
+        return {
+            "success": True,
+            "merged_url": merged_url,
+            "video_duration": round(video_dur, 1),
+            "audio_duration": round(audio_dur, 1),
+            "job_id": job_id
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        tb = traceback.format_exc()
+        print("=== MERGE ERRO ===", flush=True)
+        print(tb, flush=True)
+        raise HTTPException(500, f"Erro no merge: {str(e)}")
+    finally:
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 @app.post("/generate-free")
 async def generate_free_video(req: VideoRequest):
+    """
+    Pipeline Free — custo zero:
+    1. Baixa imagem do produto
+    2. Baixa áudio ElevenLabs
+    3. Cria vídeo com ffmpeg
+    4. Faz upload para Supabase Storage
+    5. Retorna URL pública do vídeo
+    """
     job_id = str(uuid.uuid4())[:8]
     tmp_dir = Path(tempfile.mkdtemp())
 
@@ -72,7 +212,6 @@ async def generate_free_video(req: VideoRequest):
             img = img.crop((offset, 0, offset + new_w, img.height))
         else:
             new_h = int(img.width / ratio)
-            # Foco no centro (não no topo) para produtos — evita cortar o produto
             offset = max(0, (img.height - new_h) // 3)
             img = img.crop((0, offset, img.width, offset + new_h))
         img = img.resize((W, H), Image.LANCZOS)
@@ -115,21 +254,13 @@ async def generate_free_video(req: VideoRequest):
                 draw.text((x, y + i * (font_size + 8)), l, font=font,
                           fill=color, stroke_width=stroke, stroke_fill=(0, 0, 0))
 
-        # Hook — topo
         draw_text_wrapped(draw, req.hook_text, 80, 26, (255, 255, 255), W - 80)
-
-        # Nome do produto — meio
         if req.product_name:
             draw_text_wrapped(draw, req.product_name.upper(), H // 2 - 20, 22, (0, 255, 136), W - 80, stroke=1)
-
-        # CTA — rodapé
         draw_text_wrapped(draw, req.cta_text, H - 160, 25, (255, 255, 255), W - 80)
-
-        # Hashtags
         if req.hashtags:
             draw_text_wrapped(draw, req.hashtags[:60], H - 80, 16, (170, 170, 170), W - 80, stroke=1)
 
-        # Salvar frame tratado
         frame_path = tmp_dir / f"frame_{job_id}.jpg"
         img.save(str(frame_path), quality=90)
 
@@ -147,8 +278,6 @@ async def generate_free_video(req: VideoRequest):
         # ── 5. Compor vídeo com ffmpeg direto ────────────────────
         output_path = tmp_dir / f"video_{job_id}.mp4"
 
-        # ffmpeg: imagem estática + fade in/out + áudio
-        # Muito mais rápido que moviepy frame-a-frame
         ffmpeg_cmd = [
             "ffmpeg", "-y",
             "-loop", "1",
