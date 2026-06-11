@@ -35,7 +35,7 @@ class MergeRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "Creatorly Video Server online", "version": "2.3"}
+    return {"status": "Creatorly Video Server online", "version": "2.4"}
 
 @app.get("/health")
 def health():
@@ -204,7 +204,7 @@ async def generate_free_video(req: VideoRequest):
 
         # ── 2. Processar cada frame ──────────────────────────────
         prepared_paths = []
-        for idx, src in enumerate(frames_data[:8]):  # máximo 8 frames
+        for idx, src in enumerate(frames_data[:20]):  # máximo 20 frames
             raw_path = tmp_dir / f"raw_{job_id}_{idx}.jpg"
             try:
                 decode_image(src, raw_path)
@@ -266,7 +266,7 @@ async def generate_free_video(req: VideoRequest):
         else:
             # Múltiplos frames — sequência animada
             # Cada frame fica por (duration / n_frames) segundos
-            frame_duration = max(0.5, duration / n_frames)
+            frame_duration = min(1.0, max(0.3, duration / n_frames))  # 0.3s a 1.0s por frame
             # Cria arquivo de lista para ffmpeg concat
             concat_file = tmp_dir / "frames.txt"
             with open(str(concat_file), 'w') as cf:
