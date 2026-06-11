@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
-import httpx, asyncio, os, uuid, tempfile, traceback, subprocess
+import httpx, asyncio, os, uuid, tempfile, traceback, subprocess, base64 as b64lib
 from pathlib import Path
 
 app = FastAPI(title="Creatorly Video Server")
@@ -34,7 +34,7 @@ class MergeRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "Creatorly Video Server online", "version": "2.1"}
+    return {"status": "Creatorly Video Server online", "version": "2.2"}
 
 @app.get("/health")
 def health():
@@ -83,11 +83,7 @@ async def merge_video_audio(req: MergeRequest):
         # ── 3. Merge com ffmpeg ──────────────────────────────────
         output_path = tmp_dir / f"merged_{job_id}.mp4"
 
-        # Estratégia: áudio define o tempo final
-        # Se áudio for maior que vídeo → loop no vídeo
-        # Se vídeo for maior → corta no fim do áudio
         if audio_dur > video_dur and video_dur > 0:
-            # Loop no vídeo para cobrir o áudio
             ffmpeg_cmd = [
                 "ffmpeg", "-y",
                 "-stream_loop", "-1", "-i", str(video_path),
@@ -104,7 +100,6 @@ async def merge_video_audio(req: MergeRequest):
                 str(output_path)
             ]
         else:
-            # Vídeo >= áudio — corta no fim do áudio
             ffmpeg_cmd = [
                 "ffmpeg", "-y",
                 "-i", str(video_path),
@@ -171,7 +166,7 @@ async def merge_video_audio(req: MergeRequest):
 async def generate_free_video(req: VideoRequest):
     """
     Pipeline Free — custo zero:
-    1. Baixa imagem do produto
+    1. Baixa ou decodifica imagem do produto (URL HTTP ou base64)
     2. Baixa áudio ElevenLabs
     3. Cria vídeo com ffmpeg
     4. Faz upload para Supabase Storage
@@ -181,29 +176,41 @@ async def generate_free_video(req: VideoRequest):
     tmp_dir = Path(tempfile.mkdtemp())
 
     try:
-        # ── 1. Baixar assets ─────────────────────────────────────
-        async with httpx.AsyncClient(timeout=30) as client:
-            img_resp = await client.get(req.product_image_url)
-            if img_resp.status_code != 200:
-                raise HTTPException(400, "Não foi possível baixar a imagem do produto")
-            img_path = tmp_dir / f"product_{job_id}.jpg"
-            img_path.write_bytes(img_resp.content)
+        img_path = tmp_dir / f"product_{job_id}.jpg"
 
+        # ── 1. Obter imagem do produto (URL HTTP ou base64) ──────
+        if req.product_image_url.startswith('data:'):
+            # Base64 direto — decodifica sem HTTP
+            try:
+                b64data = req.product_image_url.split(',')[1]
+                img_path.write_bytes(b64lib.b64decode(b64data))
+                print(f"[generate-free] imagem via base64 — {len(b64data)} chars")
+            except Exception as e:
+                raise HTTPException(400, f"Falha ao decodificar imagem base64: {str(e)}")
+        else:
+            # URL HTTP normal
+            async with httpx.AsyncClient(timeout=30) as client:
+                img_resp = await client.get(req.product_image_url)
+                if img_resp.status_code != 200:
+                    raise HTTPException(400, "Não foi possível baixar a imagem do produto")
+                img_path.write_bytes(img_resp.content)
+                print(f"[generate-free] imagem via URL — {img_resp.status_code}")
+
+        # ── 2. Baixar áudio ──────────────────────────────────────
+        async with httpx.AsyncClient(timeout=30) as client:
             audio_resp = await client.get(req.audio_url)
             if audio_resp.status_code != 200:
                 raise HTTPException(400, "Não foi possível baixar o áudio")
             audio_path = tmp_dir / f"audio_{job_id}.mp3"
             audio_path.write_bytes(audio_resp.content)
 
-        # ── 2. Preparar imagem 9:16 720x1280 com Pillow ──────────
+        # ── 3. Preparar imagem 9:16 720x1280 com Pillow ──────────
         from PIL import Image, ImageDraw, ImageFont
-        import numpy as np
 
         W, H = 720, 1280
 
         img = Image.open(str(img_path)).convert("RGB")
 
-        # Crop inteligente para 9:16 — centralizado verticalmente com leve foco no topo
         ratio = W / H
         img_ratio = img.width / img.height
         if img_ratio > ratio:
@@ -216,12 +223,11 @@ async def generate_free_video(req: VideoRequest):
             img = img.crop((0, offset, img.width, offset + new_h))
         img = img.resize((W, H), Image.LANCZOS)
 
-        # Overlay escuro para legibilidade do texto
         overlay = Image.new("RGBA", (W, H), (0, 0, 0, 90))
         img = img.convert("RGBA")
         img = Image.alpha_composite(img, overlay).convert("RGB")
 
-        # ── 3. Adicionar textos na imagem ────────────────────────
+        # ── 4. Adicionar textos na imagem ────────────────────────
         draw = ImageDraw.Draw(img)
 
         def get_font(size):
@@ -264,7 +270,7 @@ async def generate_free_video(req: VideoRequest):
         frame_path = tmp_dir / f"frame_{job_id}.jpg"
         img.save(str(frame_path), quality=90)
 
-        # ── 4. Obter duração do áudio ────────────────────────────
+        # ── 5. Obter duração do áudio ────────────────────────────
         probe = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", str(audio_path)],
@@ -275,7 +281,7 @@ async def generate_free_video(req: VideoRequest):
         except:
             duration = 30.0
 
-        # ── 5. Compor vídeo com ffmpeg direto ────────────────────
+        # ── 6. Compor vídeo com ffmpeg ───────────────────────────
         output_path = tmp_dir / f"video_{job_id}.mp4"
 
         ffmpeg_cmd = [
@@ -302,7 +308,7 @@ async def generate_free_video(req: VideoRequest):
             print("ffmpeg stderr:", proc.stderr[-500:])
             raise HTTPException(500, f"ffmpeg falhou: {proc.stderr[-200:]}")
 
-        # ── 6. Upload para Supabase Storage ──────────────────────
+        # ── 7. Upload para Supabase Storage ──────────────────────
         video_bytes = output_path.read_bytes()
         filename = f"free-videos/{req.user_id or 'anon'}/{job_id}.mp4"
 
@@ -333,7 +339,6 @@ async def generate_free_video(req: VideoRequest):
     except HTTPException:
         raise
     except Exception as e:
-        import sys
         tb = traceback.format_exc()
         print("=== ERRO DETALHADO ===", flush=True)
         print(tb, flush=True)
