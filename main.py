@@ -35,7 +35,7 @@ class MergeRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "Creatorly Video Server online", "version": "2.5"}
+    return {"status": "Creatorly Video Server online", "version": "2.6"}
 
 @app.get("/health")
 def health():
@@ -281,12 +281,50 @@ async def generate_free_video(req: VideoRequest):
 
             print(f"[generate-free] loop: {loops_needed}x — {len(looped_frames)} frames totais")
 
+            # Ken Burns — zoom + pan suave em cada frame via ffmpeg
+            # Cada frame recebe um efeito diferente para variedade
+            fps = 25
+            frames_per_clip = int(frame_duration * fps)
+            kb_effects = [
+                f"scale=8000:-1,zoompan=z='zoom+0.0015':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames_per_clip}:s={W}x{H}:fps={fps}",
+                f"scale=8000:-1,zoompan=z='zoom+0.001':x='iw/2-(iw/zoom/2)+{W//8}*on/{frames_per_clip}':y='ih/2-(ih/zoom/2)':d={frames_per_clip}:s={W}x{H}:fps={fps}",
+                f"scale=8000:-1,zoompan=z='if(lte(zoom,1.0),1.5,max(1.001,zoom-0.0015))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames_per_clip}:s={W}x{H}:fps={fps}",
+                f"scale=8000:-1,zoompan=z='zoom+0.001':x='0':y='ih/2-(ih/zoom/2)':d={frames_per_clip}:s={W}x{H}:fps={fps}",
+                f"scale=8000:-1,zoompan=z='zoom+0.001':x='iw-(iw/zoom)':y='ih/2-(ih/zoom/2)':d={frames_per_clip}:s={W}x{H}:fps={fps}",
+            ]
+
+            # Gera vídeo Ken Burns para cada frame separadamente
+            kb_video_paths = []
+            for fi, fp in enumerate(looped_frames):
+                kb_out = tmp_dir / f"kb_{job_id}_{fi:03d}.mp4"
+                effect = kb_effects[fi % len(kb_effects)]
+                kb_cmd = [
+                    "ffmpeg", "-y", "-loop", "1", "-i", str(fp),
+                    "-vf", effect,
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
+                    "-t", str(frame_duration),
+                    "-pix_fmt", "yuv420p", str(kb_out)
+                ]
+                kb_proc = subprocess.run(kb_cmd, capture_output=True, text=True, timeout=30)
+                if kb_proc.returncode == 0:
+                    kb_video_paths.append(kb_out)
+
+            if not kb_video_paths:
+                raise HTTPException(500, "Falha ao gerar Ken Burns")
+
+            print(f"[generate-free] Ken Burns: {len(kb_video_paths)} clipes gerados")
+
+            # Concatena todos os clipes Ken Burns
+            kb_concat = tmp_dir / "kb_list.txt"
+            with open(str(kb_concat), 'w') as cf:
+                for kp in kb_video_paths:
+                    cf.write(f"file '{kp}'\n")
+
             ffmpeg_cmd = [
                 "ffmpeg", "-y",
-                "-f", "concat", "-safe", "0", "-i", str(concat_file),
+                "-f", "concat", "-safe", "0", "-i", str(kb_concat),
                 "-i", str(audio_path),
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
-                "-vf", f"scale={W}:{H}:force_original_aspect_ratio=disable,fade=t=in:st=0:d=0.5",
                 "-c:a", "aac", "-b:a", "128k", "-shortest",
                 "-pix_fmt", "yuv420p", "-movflags", "+faststart",
                 str(output_path)
