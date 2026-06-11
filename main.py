@@ -35,7 +35,7 @@ class MergeRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "Creatorly Video Server online", "version": "2.4"}
+    return {"status": "Creatorly Video Server online", "version": "2.5"}
 
 @app.get("/health")
 def health():
@@ -267,14 +267,19 @@ async def generate_free_video(req: VideoRequest):
             # Múltiplos frames — sequência animada
             # Cada frame fica por (duration / n_frames) segundos
             frame_duration = min(1.0, max(0.3, duration / n_frames))  # 0.3s a 1.0s por frame
-            # Cria arquivo de lista para ffmpeg concat
+            # Loop dos frames para cobrir toda a duração do áudio
+            import math
+            loops_needed = math.ceil(duration / (n_frames * frame_duration))
+            looped_frames = (prepared_paths * (loops_needed + 1))[:int(duration / frame_duration) + 2]
+
             concat_file = tmp_dir / "frames.txt"
             with open(str(concat_file), 'w') as cf:
-                for fp in prepared_paths:
+                for fp in looped_frames:
                     cf.write(f"file '{fp}'\n")
                     cf.write(f"duration {frame_duration:.2f}\n")
-                # Adiciona último frame novamente (necessário para ffmpeg concat)
-                cf.write(f"file '{prepared_paths[-1]}'\n")
+                cf.write(f"file '{looped_frames[-1]}'\n")
+
+            print(f"[generate-free] loop: {loops_needed}x — {len(looped_frames)} frames totais")
 
             ffmpeg_cmd = [
                 "ffmpeg", "-y",
